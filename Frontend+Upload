@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AWS AI Attendance System</title>
+    <script src="https://sdk.amazonaws.com/js/aws-sdk-2.1563.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/amazon-cognito-identity-js@6.3.7/dist/amazon-cognito-identity.min.js"></script>
+</head>
+<body style="text-align:center; font-family: 'Segoe UI', sans-serif; background-color: #f4f7f6; padding-top: 50px;">
+    
+    <div style="background: white; display: inline-block; padding: 30px; border-radius: 15px; box-shadow: 0 10px 25px rgba(0,0,0,0.1);">
+        <h1 style="color: #232f3e;">Employee Check-In</h1>
+        <hr style="border: 0; border-top: 1px solid #eee; margin-bottom: 20px;">
+
+        <div id="loginSection">
+            <input id="username" type="text" placeholder="Username" style="padding: 12px; width: 250px; border: 1px solid #ddd; border-radius: 5px;"><br><br>
+            <input id="password" type="password" placeholder="Password" style="padding: 12px; width: 250px; border: 1px solid #ddd; border-radius: 5px;"><br><br>
+            <button onclick="login()" style="padding: 12px 30px; background: #232f3e; color: white; border: none; border-radius: 5px; cursor: pointer; width: 100%;">Login</button>
+        </div>
+
+        <div id="cameraSection" style="display:none;">
+            <p id="userGreeting" style="font-weight: bold; color: #555;"></p>
+            <video id="video" width="400" autoplay style="border: 4px solid #232f3e; border-radius: 10px; background: #000;"></video><br><br>
+            <button id="checkInBtn" onclick="captureAndUpload()" style="padding: 15px 40px; background: #ff9900; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 1.1em;">Check In Now</button>
+        </div>
+        
+        <div id="resultCard" style="display:none; margin-top: 20px; padding: 15px; border-radius: 8px;">
+            <p id="status" style="font-weight: bold; margin: 0;"></p>
+            <p id="details" style="font-size: 0.9em; color: #666; margin-top: 5px;"></p>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. CONFIGURATION ---
+        const REGION = 'us-east-1';
+        const USER_POOL_ID = 'us-east-1_yNw85HCO4';
+        const CLIENT_ID = '7su93crv2p8i2p4k8la1ah5v8r';
+        const IDENTITY_POOL_ID = 'us-east-1:1be88aba-9770-4bde-bab7-51461632f49f';
+        const BUCKET_NAME = 'employee-gallery';
+        const TABLE_NAME = 'AttendanceLog';
+
+        let idToken = '';
+        let currentUsername = '';
+
+        // --- 2. LOGIN LOGIC ---
+        function login() {
+            currentUsername = document.getElementById('username').value;
+            const userPool = new AmazonCognitoIdentity.CognitoUserPool({ UserPoolId: USER_POOL_ID, ClientId: CLIENT_ID });
+            const cognitoUser = new AmazonCognitoIdentity.CognitoUser({ Username: currentUsername, Pool: userPool });
+            const authDetails = new AmazonCognitoIdentity.AuthenticationDetails({ Username: currentUsername, Password: document.getElementById('password').value });
+
+            cognitoUser.authenticateUser(authDetails, {
+                onSuccess: (result) => {
+                    idToken = result.getIdToken().getJwtToken();
+                    document.getElementById('loginSection').style.display = 'none';
+                    document.getElementById('cameraSection').style.display = 'block';
+                    document.getElementById('userGreeting').innerText = "Welcome, " + currentUsername;
+                    startCamera();
+                },
+                onFailure: (err) => alert("Login Failed: " + err.message)
+            });
+        }
+
+        function startCamera() {
+            navigator.mediaDevices.getUserMedia({ video: true })
+                .then(s => document.getElementById('video').srcObject = s)
+                .catch(err => alert("Camera Error: " + err.message));
+        }
+
+        // --- 3. UPLOAD & INTEGRATION LOGIC ---
+        function captureAndUpload() {
+            updateStatus("Capturing image...", "#666");
+            const video = document.getElementById('video');
+            const canvas = document.createElement('canvas');
+            canvas.width = 400; canvas.height = 300;
+            canvas.getContext('2d').drawImage(video, 0, 0, 400, 300);
+
+            canvas.toBlob(blob => {
+                AWS.config.region = REGION;
+                AWS.config.credentials = new AWS.CognitoIdentityCredentials({
+                    IdentityPoolId: IDENTITY_POOL_ID,
+                    Logins: { [`cognito-idp.${REGION}.amazonaws.com/${USER_POOL_ID}`]: idToken }
+                });
+
+                AWS.config.credentials.get((err) => {
+                    if (err) return updateStatus("Auth Error: " + err.message, "red");
+
+                    const s3 = new AWS.S3();
+                    // Using a unique key so we can track this specific check-in
+                    const fileKey = uploads/${currentUsername}_${Date.now()}.jpg;
+
+                    s3.putObject({
+                        Bucket: BUCKET_NAME,
+                        Key: fileKey,
+                        Body: blob,
+                        ContentType: 'image/jpeg'
+                    }, (err) => {
+                        if (err) return updateStatus("Upload Error: " + err.message, "red");
+                        
+                        updateStatus("Image uploaded! AI is verifying...", "#ff9900");
+                        // WAIT 4 SECONDS for Lambda and Rekognition to finish
+                        setTimeout(verifyAttendance, 4000);
+                    });
+                });
+            }, 'image/jpeg');
+        }
+
+        // --- 4. THE FINAL BRIDGE: CHECK DYNAMODB ---
+        function verifyAttendance() {
+            const dynamodb = new AWS.DynamoDB.DocumentClient();
+            
+            // Look for the most recent entry for this employee
+            const params = {
+                TableName: TABLE_NAME,
+                KeyConditionExpression: "EmployeeID = :id",
+                ExpressionAttributeValues: { ":id": currentUsername },
+                Limit: 1,
+                ScanIndexForward: false // Get the newest record first
+            };
+
+            dynamodb.query(params, (err, data) => {
+                if (err) {
+                    updateStatus("Verification Error: " + err.message, "red");
+                } else if (data.Items.length > 0) {
+                    const record = data.Items[0];
+                    updateStatus("✅ Attendance Verified!", "green");
+                    document.getElementById('details').innerText = Matched with ${record.Confidence}% confidence at ${record.Timestamp};
+                } else {
+                    updateStatus("❌ Face Not Recognized", "red");
+                    document.getElementById('details').innerText = "Please try again or contact HR.";
+                }
+            });
+        }
+
+        function updateStatus(msg, color) {
+            const card = document.getElementById('resultCard');
+            const status = document.getElementById('status');
+            card.style.display = 'block';
+            card.style.backgroundColor = color === 'green' ? '#e8f5e9' : (color === 'red' ? '#ffebee' : '#fff3e0');
+            status.innerText = msg;
+            status.style.color = color;
+        }
+    </script>
+</body>
+</html>
